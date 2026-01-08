@@ -1,6 +1,8 @@
 use std::convert::{Infallible, TryFrom};
 
+use log::error;
 use nix::sys::signal::Signal;
+use serde::{Deserialize, Serialize};
 use tokio::sync::mpsc;
 use warp::http::StatusCode;
 
@@ -17,7 +19,7 @@ pub struct OkReply {
 }
 
 pub async fn send_kill_signal(
-    mut tx_sig: mpsc::Sender<Signal>,
+    tx_sig: mpsc::Sender<Signal>,
     kill_signal: KillSignal,
 ) -> Result<impl warp::Reply, Infallible> {
     {

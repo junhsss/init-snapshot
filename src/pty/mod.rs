@@ -4,8 +4,9 @@ use std::os::unix::io::{AsRawFd, RawFd};
 use std::pin::Pin;
 use std::task::{Context, Poll};
 
+use log::debug;
 use tokio::fs::File as TokioFile;
-use tokio::io::{AsyncRead, AsyncWrite};
+use tokio::io::{AsyncRead, AsyncWrite, ReadBuf};
 use tokio::process::Command;
 
 /*
@@ -103,8 +104,8 @@ impl AsyncRead for PtyMasterRead {
     fn poll_read(
         self: Pin<&mut Self>,
         cx: &mut Context,
-        buf: &mut [u8],
-    ) -> Poll<Result<usize, io::Error>> {
+        buf: &mut ReadBuf<'_>,
+    ) -> Poll<Result<(), io::Error>> {
         self.get_file().poll_read(cx, buf)
     }
 }

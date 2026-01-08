@@ -1,34 +1,29 @@
-#[macro_use]
-extern crate log;
-
+use std::collections::HashMap;
 use std::env;
 use std::fs::{self, File};
 use std::io::{self, BufReader, Write};
 use std::os::unix::io::{AsRawFd, FromRawFd};
-use std::os::unix::process::ExitStatusExt;
 use std::sync::Arc;
 use std::time::Duration;
-use std::{collections::HashMap, convert::TryFrom};
 
 use anyhow::Error;
-use futures::{StreamExt, TryStreamExt};
+use futures::TryStreamExt;
 use ifstructs::ifreq;
 use ipnetwork::IpNetwork;
 use libc::pid_t;
+use log::{debug, error, info, trace, warn};
 use nix::errno::Errno;
 use nix::ioctl_write_ptr_bad;
-use nix::mount::{mount as nix_mount, umount, umount2, MntFlags, MsFlags};
-use nix::sys::socket::SockAddr;
+use nix::mount::{MntFlags, MsFlags, mount as nix_mount, umount, umount2};
 use nix::sys::{
     self,
     stat::Mode,
-    wait::{waitpid, WaitPidFlag, WaitStatus},
+    wait::{WaitPidFlag, WaitStatus, waitpid},
 };
 use nix::unistd::{
-    chdir as nix_chdir, chown, chroot as nix_chroot, close, fchown, mkdir as nix_mkdir,
-    sethostname, symlinkat, sync, Gid, Group, Uid, User,
+    Gid, Group, Uid, User, chdir as nix_chdir, chown, chroot as nix_chroot, close, fchown,
+    mkdir as nix_mkdir, sethostname, symlinkat, sync,
 };
-use nix::NixPath;
 use os_pipe::pipe;
 use sys::socket::{AddressFamily, SockFlag, SockType};
 use tokio::io::AsyncBufReadExt;
@@ -36,7 +31,7 @@ use tokio::process::Command;
 use tokio::sync::Mutex;
 use tokio_vsock::VsockListener;
 
-use fly_init::{ImageConfig, RunConfig};
+use fly_init::RunConfig;
 
 #[derive(Debug, thiserror::Error)]
 enum InitError {
@@ -99,7 +94,6 @@ enum ConfigError {
 }
 
 const SIOCETHTOOL: u32 = 0x8946;
-const IFA_F_NODAD: u8 = 0x02;
 
 //const ETHTOOL_GRXCSUM: u32 = 0x00000014;
 const ETHTOOL_SRXCSUM: u32 = 0x00000015;
@@ -117,10 +111,7 @@ ioctl_write_ptr_bad!(ethtoolset, SIOCETHTOOL, ifreq);
 pub fn ethtool_set(name: &str, cmd: u32, value: u32) -> nix::Result<()> {
     let mut ifres = ifreq::from_name(name);
     if let Ok(ref mut ifr) = ifres {
-        let mut ev = EthtoolValue {
-            cmd: cmd,
-            value: value,
-        };
+        let mut ev = EthtoolValue { cmd, value };
 
         ifr.ifr_ifru.ifr_data = (&mut ev as *mut EthtoolValue).cast::<_>();
 
@@ -131,9 +122,9 @@ pub fn ethtool_set(name: &str, cmd: u32, value: u32) -> nix::Result<()> {
             None,
         )?;
 
-        let res = unsafe { ethtoolset(sfd, ifr) };
+        let res = unsafe { ethtoolset(sfd.as_raw_fd(), ifr) };
 
-        close(sfd)?;
+        close(sfd.as_raw_fd())?;
 
         match res {
             Ok(_) => {
@@ -145,7 +136,7 @@ pub fn ethtool_set(name: &str, cmd: u32, value: u32) -> nix::Result<()> {
         }
     }
 
-    return Err(nix::Error::invalid_argument());
+    Err(Errno::EINVAL)
 }
 
 pub fn log_init() {
@@ -155,9 +146,9 @@ pub fn log_init() {
     env_logger::builder()
         .parse_filters(&level)
         .write_style(env_logger::WriteStyle::Never)
-        .default_format_level(false)
-        .default_format_module_path(false)
-        .default_format_timestamp(false)
+        .format_level(false)
+        .format_module_path(false)
+        .format_timestamp(None)
         .init();
 }
 
@@ -178,7 +169,10 @@ async fn main() -> Result<(), InitError> {
     // let chmod_0777 = Mode::S_IRWXU | Mode::S_IRWXG | Mode::S_IRWXO;
     let common_mnt_flags: MsFlags = MsFlags::MS_NODEV | MsFlags::MS_NOEXEC | MsFlags::MS_NOSUID;
 
-    info!("Starting init (commit: {})...", env!("VERGEN_SHA_SHORT"));
+    info!(
+        "Starting init (commit: {})...",
+        option_env!("VERGEN_GIT_SHA").unwrap_or("unknown")
+    );
 
     let conf_reader = BufReader::new(File::open("/fly/run.json").map_err(ConfigError::from)?);
     let conf: RunConfig = serde_json::from_reader(conf_reader).map_err(ConfigError::from)?;
@@ -203,7 +197,7 @@ async fn main() -> Result<(), InitError> {
     };
 
     debug!("Mounting newroot fs");
-    mount::<_, _, _, [u8]>(
+    mount::<_, _, _, str>(
         Some(root_device.as_str()),
         "/newroot",
         Some("ext4"),
@@ -214,7 +208,7 @@ async fn main() -> Result<(), InitError> {
     // Move /dev so we don't have to re-mount it
     debug!("Mounting (move) /dev");
     mkdir("/newroot/dev", chmod_0755).ok();
-    mount::<_, _, [u8], [u8]>(Some("/dev"), "/newroot/dev", None, MsFlags::MS_MOVE, None)?;
+    mount::<_, _, str, str>(Some("/dev"), "/newroot/dev", None, MsFlags::MS_MOVE, None)?;
 
     // Saving some space
     debug!("Removing /fly");
@@ -225,7 +219,7 @@ async fn main() -> Result<(), InitError> {
     // Change directory to the new root
     chdir("/newroot")?;
     // Mount the new root over /
-    mount::<_, _, [u8], [u8]>(Some("."), "/", None, MsFlags::MS_MOVE, None)?;
+    mount::<_, _, str, str>(Some("."), "/", None, MsFlags::MS_MOVE, None)?;
     // Change root to the current directory (new root)
     chroot(".")?;
     // Change directory to /
@@ -243,7 +237,7 @@ async fn main() -> Result<(), InitError> {
 
     debug!("Mounting /dev/mqueue");
     mkdir("/dev/mqueue", chmod_0755).ok();
-    mount::<_, _, _, [u8]>(
+    mount::<_, _, _, str>(
         Some("mqueue"),
         "/dev/mqueue",
         Some("mqueue"),
@@ -253,7 +247,7 @@ async fn main() -> Result<(), InitError> {
 
     debug!("Mounting /dev/shm");
     mkdir("/dev/shm", chmod_1777).ok();
-    mount::<_, _, _, [u8]>(
+    mount::<_, _, _, str>(
         Some("shm"),
         "/dev/shm",
         Some("tmpfs"),
@@ -273,8 +267,8 @@ async fn main() -> Result<(), InitError> {
 
     debug!("Mounting /proc");
     mkdir("/proc", chmod_0555).ok();
-    mount::<_, _, _, [u8]>(Some("proc"), "/proc", Some("proc"), common_mnt_flags, None)?;
-    mount::<_, _, _, [u8]>(
+    mount::<_, _, _, str>(Some("proc"), "/proc", Some("proc"), common_mnt_flags, None)?;
+    mount::<_, _, _, str>(
         Some("binfmt_misc"),
         "/proc/sys/fs/binfmt_misc",
         Some("binfmt_misc"),
@@ -284,7 +278,7 @@ async fn main() -> Result<(), InitError> {
 
     debug!("Mounting /sys");
     mkdir("/sys", chmod_0555).ok();
-    mount::<_, _, _, [u8]>(Some("sys"), "/sys", Some("sysfs"), common_mnt_flags, None)?;
+    mount::<_, _, _, str>(Some("sys"), "/sys", Some("sysfs"), common_mnt_flags, None)?;
 
     debug!("Mounting /run");
     mkdir("/run", chmod_0755).ok();
@@ -428,10 +422,7 @@ async fn main() -> Result<(), InitError> {
 
     rlimit::setrlimit(rlimit::Resource::NOFILE, 10240, 10240).ok();
 
-    let image_conf = conf
-        .image_config
-        .clone()
-        .unwrap_or_else(|| ImageConfig::default());
+    let image_conf = conf.image_config.clone().unwrap_or_default();
 
     let user = if let Some(user_override) = conf.user_override {
         user_override
@@ -459,12 +450,12 @@ async fn main() -> Result<(), InitError> {
                     _ => (Uid::from_raw(uid), Gid::from_raw(uid), "/".into()),
                 }
             } else {
-                return Err(InitError::UserNotFound(user.into()).into());
+                return Err(InitError::UserNotFound(user.into()));
             }
         }
         Err(e) => {
             if user != "root" {
-                return Err(InitError::UserNotFound(user.into()).into());
+                return Err(InitError::UserNotFound(user.into()));
             }
             debug!("error getting user '{}' by name => {}", user, e);
             match User::from_name("root") {
@@ -478,14 +469,14 @@ async fn main() -> Result<(), InitError> {
         debug!("searching for group '{}'", group);
         match Group::from_name(group) {
             Err(_e) => {
-                return Err(InitError::GroupNotFound(group.into()).into());
+                return Err(InitError::GroupNotFound(group.into()));
             }
             Ok(Some(g)) => gid = g.gid,
             Ok(None) => {
                 if let Ok(raw_gid) = group.parse::<u32>() {
                     gid = Gid::from_raw(raw_gid);
                 } else {
-                    return Err(InitError::GroupNotFound(group.into()).into());
+                    return Err(InitError::GroupNotFound(group.into()));
                 }
             }
         }
@@ -510,15 +501,18 @@ async fn main() -> Result<(), InitError> {
 
     // if we have a PATH, set it on the OS to be able to find argv[0]
     if let Some(p) = envs.get("PATH") {
-        if p != "" {
-            env::set_var("PATH", p);
+        if !p.is_empty() {
+            // SAFETY: We're in the init process, single-threaded at this point
+            unsafe { env::set_var("PATH", p) };
         }
     }
 
     envs.entry("HOME".to_owned())
         .or_insert(home_dir.to_string_lossy().into_owned());
 
-    let incoming = VsockListener::bind(&SockAddr::new_vsock(3, 10000))?.incoming();
+    let vsock_addr = tokio_vsock::VsockAddr::new(3, 10000);
+    let listener = VsockListener::bind(vsock_addr)?;
+    let incoming = listener.incoming();
 
     let waitpid_mutex = Arc::new(Mutex::new(()));
 
@@ -531,14 +525,14 @@ async fn main() -> Result<(), InitError> {
             info!("Mounting {} at {}", m.device_path, m.mount_path);
 
             if let Err(e) = nix_mkdir(m.mount_path.as_str(), chmod_0755) {
-                if let Some(nix::errno::Errno::EEXIST) = e.as_errno() {
+                if e == Errno::EEXIST {
                     warn!("directory {} already exists", m.mount_path);
                 } else {
                     panic!("could not create directory {}: {}", m.mount_path, e);
                 }
             }
 
-            mount::<_, _, _, [u8]>(
+            mount::<_, _, _, str>(
                 Some(m.device_path.as_str()),
                 m.mount_path.as_str(),
                 Some("ext4"),
@@ -561,30 +555,25 @@ async fn main() -> Result<(), InitError> {
     match conf.exec_override {
         Some(ref ovrd) => argv = ovrd.clone(),
         None => {
-            match image_conf.entrypoint {
-                Some(ref entry) => {
-                    argv = entry.clone();
-                }
-                _ => {}
-            };
+            if let Some(ref entry) = image_conf.entrypoint {
+                argv = entry.clone();
+            }
             match conf.cmd_override {
                 Some(ref ovrd) => {
                     argv.push(ovrd.clone());
                 }
-                None => match image_conf.cmd {
-                    Some(ref c) => {
+                None => {
+                    if let Some(ref c) = image_conf.cmd {
                         argv.append(&mut c.clone());
                     }
-                    _ => {}
-                },
+                }
             };
         }
     };
 
-    match sethostname(&conf.hostname) {
-        Err(e) => warn!("error setting hostname: {}", e),
-        Ok(_) => {}
-    };
+    if let Err(e) = sethostname(&conf.hostname) {
+        warn!("error setting hostname: {}", e);
+    }
 
     mkdir("/etc", chmod_0755).ok();
 
@@ -629,7 +618,7 @@ async fn main() -> Result<(), InitError> {
     let lo = handle
         .link()
         .get()
-        .set_name_filter("lo".into())
+        .match_name("lo".into())
         .execute()
         .try_next()
         .await?
@@ -642,7 +631,7 @@ async fn main() -> Result<(), InitError> {
     let eth0 = handle
         .link()
         .get()
-        .set_name_filter("eth0".into())
+        .match_name("eth0".into())
         .execute()
         .try_next()
         .await?
@@ -666,9 +655,11 @@ async fn main() -> Result<(), InitError> {
 
         for ipc in ip_configs {
             debug!("netlink: adding ip {}/{}", ipc.ip.ip(), ipc.mask);
-            let mut addr_req = address.add(eth0.header.index, ipc.ip.ip(), ipc.mask);
-            addr_req.message_mut().header.flags |= IFA_F_NODAD;
-            addr_req.execute().await?;
+            handle
+                .address()
+                .add(eth0.header.index, ipc.ip.ip(), ipc.mask)
+                .execute()
+                .await?;
 
             if let IpNetwork::V4(ipn) = ipc.ip {
                 if ipc.mask < 30 {
@@ -685,11 +676,11 @@ async fn main() -> Result<(), InitError> {
             debug!("netlink: adding default route via {}", ipc.gateway);
             match ipc.gateway {
                 IpNetwork::V4(gateway) => {
-                    route.add_v4().gateway(gateway.ip()).execute().await?;
+                    route.add().v4().gateway(gateway.ip()).execute().await?;
                 }
                 IpNetwork::V6(gateway) => {
                     if ipc.mask != 112 {
-                        route.add_v6().gateway(gateway.ip()).execute().await?;
+                        route.add().v6().gateway(gateway.ip()).execute().await?;
                     }
                 }
             }
@@ -715,14 +706,14 @@ async fn main() -> Result<(), InitError> {
     command.uid(uid.as_raw()).gid(gid.as_raw());
 
     if let Some(ref wd) = image_conf.working_dir {
-        if wd != "" {
+        if !wd.is_empty() {
             debug!("Setting current dir on command to: {}", wd);
             command.current_dir(&wd);
         }
     }
 
     let child = command.spawn()?;
-    let pid = child.id() as pid_t;
+    let pid = child.id().unwrap_or(0) as pid_t;
     debug!("child pid: {}", pid);
 
     let mut stdouterr: tokio::fs::File =
@@ -739,8 +730,9 @@ async fn main() -> Result<(), InitError> {
 
     loop {
         // wait for a signal for 1 second!
-        let mut deadline = tokio::time::delay_for(Duration::from_secs(1));
+        let deadline = tokio::time::sleep(Duration::from_secs(1));
         let sig_fut = rx_sig.recv();
+        tokio::pin!(deadline);
         tokio::pin!(sig_fut);
         tokio::select! {
             _ = &mut deadline => {
@@ -775,29 +767,6 @@ async fn main() -> Result<(), InitError> {
         }
     }
 
-    // match child.await {
-    //     Ok(status) => {
-    //         if let Some(sig) = status.signal() {
-    //             info!(
-    //                 "Program exited with code: {:?} signal: {} ({})",
-    //                 status.code(),
-    //                 nix::sys::signal::Signal::try_from(sig)
-    //                     .map(|s| s.to_string())
-    //                     .unwrap_or_else(|_| sig.to_string()),
-    //                 sig
-    //             );
-    //         } else if let Some(code) = status.code() {
-    //             info!("Program exited with code: {}", code);
-    //             exit_status = code;
-    //         } else {
-    //             info!("Program exited with an unknown code and was not signaled");
-    //         }
-    //     }
-    //     Err(e) => {
-    //         debug!("error waiting for main child to exit: {}", e)
-    //     }
-    // }
-
     let mut oom_killed = false;
     match tokio::fs::File::open("/dev/kmsg").await {
         Err(e) => error!("error opening /dev/kmsg: {}", e),
@@ -809,14 +778,15 @@ async fn main() -> Result<(), InitError> {
             trace!("attempting to match '{}' from kernel logs", matcher);
 
             loop {
-                let mut delay = tokio::time::delay_for(Duration::from_millis(10));
+                let delay = tokio::time::sleep(Duration::from_millis(10));
+                tokio::pin!(delay);
                 tokio::select! {
                     _ = &mut delay => {
                         trace!("timed out waiting for OOM message");
                         break;
                     }
-                    line = lines.next() => match line {
-                        Some(Ok(line)) => {
+                    line = lines.next_line() => match line {
+                        Ok(Some(line)) => {
                             if line.contains(&matcher) {
                                 info!("Process appears to have been OOM killed!");
                                 oom_killed = true;
@@ -846,7 +816,7 @@ async fn main() -> Result<(), InitError> {
                     attempts -= 1;
                     if attempts > 0 {
                         error!("error umounting {}: {}, retrying in a bit", m.mount_path, e);
-                        tokio::time::delay_for(Duration::from_millis(750)).await;
+                        tokio::time::sleep(Duration::from_millis(750)).await;
                         continue;
                     } else {
                         if let Err(e) = umount2(m.mount_path.as_str(), MntFlags::MNT_DETACH) {
@@ -869,7 +839,7 @@ async fn main() -> Result<(), InitError> {
         }
     }
 
-    tokio::time::delay_for(Duration::from_secs(1)).await;
+    tokio::time::sleep(Duration::from_secs(1)).await;
 
     debug!("exiting after delay");
 
@@ -940,11 +910,11 @@ fn reap_zombies(pid: i32, exit_status: &mut i32) -> bool {
                 }
             }
             Err(e) => match e {
-                nix::Error::Sys(Errno::ECHILD) => {
+                Errno::ECHILD => {
                     debug!("no child to wait");
                     break;
                 }
-                nix::Error::Sys(Errno::EINTR) => {
+                Errno::EINTR => {
                     debug!("got EINTR waiting for pids, continuing...");
                     continue;
                 }
@@ -959,75 +929,49 @@ fn reap_zombies(pid: i32, exit_status: &mut i32) -> bool {
     child_exited
 }
 
-fn mount<P1: ?Sized + NixPath, P2: ?Sized + NixPath, P3: ?Sized + NixPath, P4: ?Sized + NixPath>(
+fn mount<
+    P1: AsRef<str> + ?Sized,
+    P2: AsRef<str> + ?Sized,
+    P3: AsRef<str> + ?Sized,
+    P4: AsRef<str> + ?Sized,
+>(
     source: Option<&P1>,
     target: &P2,
     fstype: Option<&P3>,
     flags: MsFlags,
     data: Option<&P4>,
 ) -> Result<(), InitError> {
-    nix_mount(source, target, fstype, flags, data).map_err(|error| InitError::Mount {
-        source: source
-            .map(|p| {
-                p.with_nix_path(|cs| {
-                    cs.to_owned()
-                        .into_string()
-                        .ok()
-                        .unwrap_or_else(|| String::new())
-                })
-                .unwrap_or_else(|_| String::new())
-            })
-            .unwrap_or_else(|| String::new()),
-        target: target
-            .with_nix_path(|cs| {
-                cs.to_owned()
-                    .into_string()
-                    .ok()
-                    .unwrap_or_else(|| String::new())
-            })
-            .unwrap_or_else(|_| String::new()),
+    nix_mount(
+        source.map(|s| s.as_ref()),
+        target.as_ref(),
+        fstype.map(|s| s.as_ref()),
+        flags,
+        data.map(|s| s.as_ref()),
+    )
+    .map_err(|error| InitError::Mount {
+        source: source.map(|s| s.as_ref().to_string()).unwrap_or_default(),
+        target: target.as_ref().to_string(),
         error,
     })
 }
 
-fn chdir<P: ?Sized + NixPath>(path: &P) -> Result<(), InitError> {
+fn chdir(path: &str) -> Result<(), InitError> {
     nix_chdir(path).map_err(|error| InitError::Chdir {
-        path: path
-            .with_nix_path(|cs| {
-                cs.to_owned()
-                    .into_string()
-                    .ok()
-                    .unwrap_or_else(|| String::new())
-            })
-            .unwrap_or_else(|_| String::new()),
+        path: path.to_string(),
         error,
     })
 }
 
-fn mkdir<P: ?Sized + NixPath>(path: &P, mode: Mode) -> Result<(), InitError> {
+fn mkdir(path: &str, mode: Mode) -> Result<(), InitError> {
     nix_mkdir(path, mode).map_err(|error| InitError::Mkdir {
-        path: path
-            .with_nix_path(|cs| {
-                cs.to_owned()
-                    .into_string()
-                    .ok()
-                    .unwrap_or_else(|| String::new())
-            })
-            .unwrap_or_else(|_| String::new()),
+        path: path.to_string(),
         error,
     })
 }
 
-fn chroot<P: ?Sized + NixPath>(path: &P) -> Result<(), InitError> {
+fn chroot(path: &str) -> Result<(), InitError> {
     nix_chroot(path).map_err(|error| InitError::Chroot {
-        path: path
-            .with_nix_path(|cs| {
-                cs.to_owned()
-                    .into_string()
-                    .ok()
-                    .unwrap_or_else(|| String::new())
-            })
-            .unwrap_or_else(|_| String::new()),
+        path: path.to_string(),
         error,
     })
 }

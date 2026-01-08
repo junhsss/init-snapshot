@@ -4,7 +4,9 @@ use std::sync::Arc;
 
 use futures::channel::oneshot;
 use futures::{Future, FutureExt, TryStream};
+use log::debug;
 use nix::sys::signal::Signal;
+use serde::{Deserialize, Serialize};
 use tokio::io::{AsyncRead, AsyncWrite};
 use tokio::sync::{mpsc, Mutex};
 use warp::Filter;
@@ -33,7 +35,10 @@ where
         let headers = res.headers_mut();
         headers.insert(
             "fly-init-version",
-            warp::http::header::HeaderValue::from_str(env!("VERGEN_SHA_SHORT")).unwrap(),
+            warp::http::header::HeaderValue::from_str(
+                option_env!("VERGEN_GIT_SHA").unwrap_or("unknown"),
+            )
+            .unwrap(),
         );
         res
     }

@@ -1,12 +1,7 @@
-#[macro_use]
-extern crate serde_derive;
-
-#[macro_use]
-extern crate log;
-
 use std::collections::HashMap;
 
 use ipnetwork::IpNetwork;
+use serde::{Deserialize, Serialize};
 
 pub mod api;
 pub mod pty;

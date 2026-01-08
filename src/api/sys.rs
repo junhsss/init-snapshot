@@ -4,6 +4,9 @@ use std::io::Read;
 
 use super::{ApiReply, ErrorMessage};
 use anyhow::Error;
+use log::debug;
+use procfs::{Current, CurrentSI};
+use serde::Serialize;
 use warp::http::StatusCode;
 
 #[derive(Debug, Serialize, Clone)]
@@ -24,16 +27,16 @@ pub struct FileFd {
 
 #[derive(Debug, Serialize, Clone)]
 pub struct Cpu {
-    user: f32,
-    nice: f32,
-    system: f32,
-    idle: f32,
-    iowait: Option<f32>,
-    irq: Option<f32>,
-    softirq: Option<f32>,
-    steal: Option<f32>,
-    guest: Option<f32>,
-    guest_nice: Option<f32>,
+    user: f64,
+    nice: f64,
+    system: f64,
+    idle: f64,
+    iowait: Option<f64>,
+    irq: Option<f64>,
+    softirq: Option<f64>,
+    steal: Option<f64>,
+    guest: Option<f64>,
+    guest_nice: Option<f64>,
 }
 
 #[derive(Debug, Serialize, Clone)]
@@ -54,7 +57,7 @@ pub struct Memory {
     shmem: Option<u64>,
     vmalloc_total: u64,
     vmalloc_used: u64,
-    vmalloc_chunk: u64,
+    vmalloc_chunk: Option<u64>,
 }
 
 #[derive(Debug, Serialize, Clone)]
@@ -79,9 +82,9 @@ pub struct NetworkDevice {
 }
 
 fn collect_sysinfo() -> Result<SysInfo, Error> {
-    let meminfo = procfs::Meminfo::new()?;
-    let load_avg = procfs::LoadAverage::new()?;
-    let kernel = procfs::KernelStats::new()?;
+    let meminfo = procfs::Meminfo::current()?;
+    let load_avg = procfs::LoadAverage::current()?;
+    let kernel = procfs::KernelStats::current()?;
 
     let mut file = File::open("/proc/sys/fs/file-nr")?;
     let mut raw_filefd = String::new();
@@ -91,7 +94,7 @@ fn collect_sysinfo() -> Result<SysInfo, Error> {
 
     let filefd = FileFd {
         allocated: splitted_fd.next().unwrap_or("0").trim().parse()?,
-        maximum: splitted_fd.skip(1).next().unwrap_or("0").trim().parse()?,
+        maximum: splitted_fd.nth(1).unwrap_or("0").trim().parse()?,
     };
 
     Ok(SysInfo {
@@ -113,7 +116,7 @@ fn collect_sysinfo() -> Result<SysInfo, Error> {
             shmem: meminfo.shmem,
             vmalloc_total: meminfo.vmalloc_total,
             vmalloc_used: meminfo.vmalloc_used,
-            vmalloc_chunk: meminfo.vmalloc_chunk,
+            vmalloc_chunk: Some(meminfo.vmalloc_chunk),
         },
         load_average: [load_avg.one, load_avg.five, load_avg.fifteen],
         cpus: kernel
@@ -124,16 +127,16 @@ fn collect_sysinfo() -> Result<SysInfo, Error> {
                 (
                     i,
                     Cpu {
-                        user: ct.user,
-                        nice: ct.nice,
-                        system: ct.system,
-                        idle: ct.idle,
-                        iowait: ct.iowait,
-                        irq: ct.irq,
-                        softirq: ct.softirq,
-                        steal: ct.steal,
-                        guest: ct.guest,
-                        guest_nice: ct.guest_nice,
+                        user: ct.user as f64,
+                        nice: ct.nice as f64,
+                        system: ct.system as f64,
+                        idle: ct.idle as f64,
+                        iowait: ct.iowait.map(|v| v as f64),
+                        irq: ct.irq.map(|v| v as f64),
+                        softirq: ct.softirq.map(|v| v as f64),
+                        steal: ct.steal.map(|v| v as f64),
+                        guest: ct.guest.map(|v| v as f64),
+                        guest_nice: ct.guest_nice.map(|v| v as f64),
                     },
                 )
             })
